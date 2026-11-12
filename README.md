@@ -253,46 +253,46 @@ svc.LogEvent(req, llm.JSONResponse{Headers: map[string]string{"Content-Type": "t
 
 ---
 
-## RAG em Camadas e RAG Supervisionado (`pkg/rag`)
+## Layered & Supervised RAG (`pkg/rag`)
 
-Esta versão do Galah incorpora nativamente em Go a arquitetura de **RAG em Camadas + RAG Supervisionado** (baseada no projeto [honeypot-llm-bench](https://github.com/rafaelrcar/honeypot-llm-bench)), permitindo que modelos locais compactos (ex.: `Qwen2.5-7B-Instruct-AWQ` via vLLM ou Ollama) atinjam alto realismo com baixa latência e zero erros 500.
+This fork of Galah includes a native Go implementation of the **Layered + Supervised RAG (Retrieval-Augmented Generation)** architecture (based on [honeypot-llm-bench](https://github.com/rafaelrcar/honeypot-llm-bench)). It enables compact, locally hosted LLMs (e.g., `Qwen2.5-7B-Instruct-AWQ` via vLLM or Ollama) to achieve high response realism with low latency and zero HTTP 500 errors.
 
-### Como Funciona (Ordem de Decisão das Camadas)
+### How It Works (Decision Layers)
 
-Quando o RAG está ativo (`--rag-enabled`, modo `layered` por padrão), cada requisição HTTP passa pelas seguintes camadas antes e depois de acionar o modelo:
+When RAG is enabled (`--rag-enabled`, `layered` mode by default), incoming HTTP requests are evaluated across the following layers before and after invoking the model:
 
-1. **Camada `404` (Sondas Aleatórias de Scanner)**:
-   - Caminhos gerados aleatoriamente por scanners para detectar servidores *catch-all* (ex.: `/aaa9`, `/%23`, `/x8f9k2l1`) retornam imediatamente uma página `404 Not Found` padrão do Apache (`Status: 404`), **sem acionar o LLM**.
-2. **Camada `cache` / `cache-ico` (Arquivos Estáticos)**:
-   - Requisições para `robots.txt`, `sitemap*.xml`, `security.txt`, `favicon.ico` ou extensões estáticas (`.png`, `.css`, `.js`, etc.) são respondidas diretamente a partir da base de conhecimento (`kb/knowledge_base.json`), sem chamar o LLM. Caso seja um `.ico` sem entrada na base, retorna `404` do Apache.
-3. **Camada `cache-api` (Bypass de JSON-dentro-de-JSON)**:
-   - Quando a requisição possui similaridade `1.0` (caminho exato ou alias na base) e o `content_type` na base é `json` ou `javascript` (ex.: `/swagger.json`, `/pods`, `/_search`, `/containers/json`), a resposta real da base é entregue diretamente sem passar pelo LLM, evitando erros de escape de JSON aninhado.
-4. **Camada `supervised` (RAG Supervisionado com Extração de Essência)**:
-   - Para rotas que pertencem a uma família presente na base (mesmo método HTTP e similaridade de Jaccard dos tokens do caminho $\ge 0.5$), o motor extrai a **essência semântica** da resposta real (`ExampleEssence` limitada a `600` caracteres por padrão: preserva `<form>` e seus atributos semânticos em HTML, remove imagens base64/scripts/estilos, inicia no primeiro `CREATE TABLE` em SQL e reduz JSON mantendo-o válido) e instrui o LLM a reproduzir a estrutura trocando apenas dados sensíveis.
-5. **Camada `free` (Geração Livre)**:
-   - Para caminhos sem correspondência na base ($\text{similaridade} < 0.5$), o modelo gera a resposta livremente com `repetition_penalty: 1.1` e `max_tokens: 1024`.
-6. **Guardrails Pós-Geração e Fallbacks (`fallback-ref`, `fallback-404`, `fallback-leak`)**:
-   - **Timeout**: Limita a espera pelo LLM a `--llm-timeout` (padrão `7s`), garantindo resposta antes do `WriteTimeout` de `10s` do servidor HTTP.
-   - **Filtro de Vazamento**: Inspeciona a saída contra padrões proibidos de infraestrutura interna (IPs privados `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` e nomes internos como `dpipot`, `cowrie`, `wordpot`, `heralding`, `.svc.cluster.local`, `kafka-svc`).
-   - Se o LLM estourar o timeout, retornar JSON inválido ou vazar infraestrutura interna, o Galah aciona automaticamente o fallback para a entrada real da base (`fallback-ref`) ou para uma página 404 limpa (`fallback-404` / `fallback-leak`).
+1. **Layer `404` (Random Scanner Probes)**:
+   - Randomly generated scanner probe paths used to detect catch-all servers (e.g., `/aaa9`, `/%23`, `/x8f9k2l1`) immediately return a standard Apache `404 Not Found` page (`Status: 404`), **without calling the LLM**.
+2. **Layer `cache` / `cache-ico` (Static Assets)**:
+   - Requests targeting `robots.txt`, `sitemap*.xml`, `security.txt`, `favicon.ico`, or static asset extensions (`.png`, `.css`, `.js`, etc.) are served directly from the knowledge base (`kb/knowledge_base.json`) without calling the LLM. If a `.ico` path has no entry in the knowledge base, a standard Apache `404` response is returned.
+3. **Layer `cache-api` (JSON-in-JSON Bypass)**:
+   - When a request matches a knowledge base entry with `1.0` token similarity (exact path or alias) and its `content_type` is `json` or `javascript` (e.g., `/swagger.json`, `/pods`, `/_search`, `/containers/json`), the real KB payload is returned directly without invoking the LLM, avoiding nested JSON escaping errors.
+4. **Layer `supervised` (Supervised RAG with Essence Extraction)**:
+   - For paths matching a known endpoint family in the knowledge base (same HTTP method and path token Jaccard similarity $\ge 0.5$), the engine extracts the **semantic essence** of the reference response (`ExampleEssence`, capped at `600` characters by default: strips `<script>`/`<style>`/`<head>`/base64 images, slims HTML attributes while preserving `<form>` semantics, starts at the first `CREATE TABLE` for SQL dumps, and recursively shrinks JSON while keeping it valid) and instructs the LLM to reproduce the reference structure while replacing only sensitive values.
+5. **Layer `free` (Free Generation)**:
+   - For unknown paths ($\text{similarity} < 0.5$), the LLM generates a response freely using `repetition_penalty: 1.1` and `max_tokens: 1024`.
+6. **Post-Generation Guardrails & Fallbacks (`fallback-ref`, `fallback-404`, `fallback-leak`)**:
+   - **Timeout Protection**: Caps LLM generation time at `--llm-timeout` (default `7s`), ensuring a fallback response is sent before the HTTP server's `10s` `WriteTimeout`.
+   - **Infrastructure Leakage Filter**: Scans model output against forbidden internal infrastructure patterns (private IP ranges `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and internal hostnames/honeypot names such as `dpipot`, `cowrie`, `wordpot`, `heralding`, `.svc.cluster.local`, `kafka-svc`).
+   - If the LLM times out, returns invalid JSON, or leaks internal infrastructure, Galah automatically falls back to the reference knowledge base entry (`fallback-ref`) or a clean Apache 404 page (`fallback-404` / `fallback-leak`).
 
 ---
 
-### Parâmetros de Configuração do RAG (CLI e Variáveis de Ambiente)
+### RAG Configuration Options (CLI Flags & Environment Variables)
 
-| Flag CLI | Variável de Ambiente | Padrão | Descrição |
+| CLI Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--rag-enabled` | `RAG_ENABLED` | `true` | Habilita ou desabilita o motor de RAG (`--rag-enabled=false` para desativar). |
-| `--rag-mode` | `RAG_MODE` | `layered` | Modo de operação: `layered` (6 camadas completas), `supervised` (apenas RAG supervisionado no prompt + fallback), `full` (exemplo como guia de estilo) ou `none`. |
-| `--rag-kb-file` | `RAG_KB_FILE` | `kb/knowledge_base.json` | Caminho local **ou URL HTTP/HTTPS** para o arquivo JSON da base de conhecimento. |
-| `--rag-max-len` | `RAG_MAX_LEN` | `600` | Tamanho máximo (em caracteres) da essência do exemplo injetada no prompt do LLM. |
-| `--llm-timeout` | `LLM_TIMEOUT` | `7` | Tempo limite (em segundos) para geração do LLM antes de acionar o fallback automático. |
+| `--rag-enabled` | `RAG_ENABLED` | `true` | Enables or disables the RAG engine (`--rag-enabled=false` to disable). |
+| `--rag-mode` | `RAG_MODE` | `layered` | Operation mode: `layered` (all 6 layers), `supervised` (supervised prompt augmentation + fallback only), `full` (reference as style guide), or `none`. |
+| `--rag-kb-file` | `RAG_KB_FILE` | `kb/knowledge_base.json` | Local file path **or HTTP/HTTPS URL** to the knowledge base JSON file. |
+| `--rag-max-len` | `RAG_MAX_LEN` | `600` | Maximum character length for the extracted reference essence injected into the LLM prompt. |
+| `--llm-timeout` | `LLM_TIMEOUT` | `7` | Timeout (in seconds) for LLM generation before triggering automatic fallback. |
 
 ---
 
-### Exemplos de Uso com RAG
+### RAG Usage Examples
 
-#### 1. Executando com a base local (`kb/knowledge_base.json`) e vLLM / OpenAI-compatible
+#### 1. Running with the local knowledge base (`kb/knowledge_base.json`) and vLLM / OpenAI-compatible server
 ```bash
 ./bin/galah \
   --provider openai \
@@ -305,7 +305,7 @@ Quando o RAG está ativo (`--rag-enabled`, modo `layered` por padrão), cada req
   --rag-kb-file kb/knowledge_base.json
 ```
 
-#### 2. Carregando a base de conhecimento diretamente de uma URL remota
+#### 2. Loading the knowledge base directly from a remote URL
 ```bash
 ./bin/galah \
   --provider ollama \
@@ -317,7 +317,7 @@ Quando o RAG está ativo (`--rag-enabled`, modo `layered` por padrão), cada req
   --rag-kb-file https://raw.githubusercontent.com/rafaelrcar/honeypot-llm-bench/refs/heads/main/kb/knowledge_base.json
 ```
 
-#### 3. Uso via Biblioteca Go (`galah.Options`)
+#### 3. Using RAG via the Go Library (`galah.Options`)
 ```go
 svc, err := galah.NewService(context.Background(), galah.Options{
     LLMProvider:    "openai",
