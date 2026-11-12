@@ -71,6 +71,14 @@ Options:
   --suricata-enabled     Enable Suricata HTTP rule checking (default: false)
   --suricata-rules-dir SURICATA-RULES-DIR
                          Directory containing Suricata .rules files to check HTTP requests against
+  --rag-enabled          Enable layered/supervised RAG with knowledge base [default: true, env: RAG_ENABLED]
+  --rag-mode RAG-MODE    RAG mode (layered, supervised, full, none) [default: layered, env: RAG_MODE]
+  --rag-kb-file RAG-KB-FILE
+                         Path or URL to RAG knowledge_base.json [default: kb/knowledge_base.json, env: RAG_KB_FILE]
+  --rag-max-len RAG-MAX-LEN
+                         Max character length for extracted reference essence in prompts [default: 600, env: RAG_MAX_LEN]
+  --llm-timeout LLM-TIMEOUT
+                         Timeout in seconds for LLM generation before RAG fallback [default: 7, env: LLM_TIMEOUT]
   --help, -h             display this help and exit
 ```
 
@@ -241,4 +249,93 @@ The service also exposes helper methods for cache and event logging when used as
 respBytes, _ := svc.CheckCache(req, "8080") // returns nil if no cached entry
 
 svc.LogEvent(req, llm.JSONResponse{Headers: map[string]string{"Content-Type": "text/plain"}, Body: "hi"}, "8080", "llm", nil)
+```
+
+---
+
+## RAG em Camadas e RAG Supervisionado (`pkg/rag`)
+
+Esta versão do Galah incorpora nativamente em Go a arquitetura de **RAG em Camadas + RAG Supervisionado** (baseada no projeto [honeypot-llm-bench](https://github.com/rafaelrcar/honeypot-llm-bench)), permitindo que modelos locais compactos (ex.: `Qwen2.5-7B-Instruct-AWQ` via vLLM ou Ollama) atinjam alto realismo com baixa latência e zero erros 500.
+
+### Como Funciona (Ordem de Decisão das Camadas)
+
+Quando o RAG está ativo (`--rag-enabled`, modo `layered` por padrão), cada requisição HTTP passa pelas seguintes camadas antes e depois de acionar o modelo:
+
+1. **Camada `404` (Sondas Aleatórias de Scanner)**:
+   - Caminhos gerados aleatoriamente por scanners para detectar servidores *catch-all* (ex.: `/aaa9`, `/%23`, `/x8f9k2l1`) retornam imediatamente uma página `404 Not Found` padrão do Apache (`Status: 404`), **sem acionar o LLM**.
+2. **Camada `cache` / `cache-ico` (Arquivos Estáticos)**:
+   - Requisições para `robots.txt`, `sitemap*.xml`, `security.txt`, `favicon.ico` ou extensões estáticas (`.png`, `.css`, `.js`, etc.) são respondidas diretamente a partir da base de conhecimento (`kb/knowledge_base.json`), sem chamar o LLM. Caso seja um `.ico` sem entrada na base, retorna `404` do Apache.
+3. **Camada `cache-api` (Bypass de JSON-dentro-de-JSON)**:
+   - Quando a requisição possui similaridade `1.0` (caminho exato ou alias na base) e o `content_type` na base é `json` ou `javascript` (ex.: `/swagger.json`, `/pods`, `/_search`, `/containers/json`), a resposta real da base é entregue diretamente sem passar pelo LLM, evitando erros de escape de JSON aninhado.
+4. **Camada `supervised` (RAG Supervisionado com Extração de Essência)**:
+   - Para rotas que pertencem a uma família presente na base (mesmo método HTTP e similaridade de Jaccard dos tokens do caminho $\ge 0.5$), o motor extrai a **essência semântica** da resposta real (`ExampleEssence` limitada a `600` caracteres por padrão: preserva `<form>` e seus atributos semânticos em HTML, remove imagens base64/scripts/estilos, inicia no primeiro `CREATE TABLE` em SQL e reduz JSON mantendo-o válido) e instrui o LLM a reproduzir a estrutura trocando apenas dados sensíveis.
+5. **Camada `free` (Geração Livre)**:
+   - Para caminhos sem correspondência na base ($\text{similaridade} < 0.5$), o modelo gera a resposta livremente com `repetition_penalty: 1.1` e `max_tokens: 1024`.
+6. **Guardrails Pós-Geração e Fallbacks (`fallback-ref`, `fallback-404`, `fallback-leak`)**:
+   - **Timeout**: Limita a espera pelo LLM a `--llm-timeout` (padrão `7s`), garantindo resposta antes do `WriteTimeout` de `10s` do servidor HTTP.
+   - **Filtro de Vazamento**: Inspeciona a saída contra padrões proibidos de infraestrutura interna (IPs privados `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` e nomes internos como `dpipot`, `cowrie`, `wordpot`, `heralding`, `.svc.cluster.local`, `kafka-svc`).
+   - Se o LLM estourar o timeout, retornar JSON inválido ou vazar infraestrutura interna, o Galah aciona automaticamente o fallback para a entrada real da base (`fallback-ref`) ou para uma página 404 limpa (`fallback-404` / `fallback-leak`).
+
+---
+
+### Parâmetros de Configuração do RAG (CLI e Variáveis de Ambiente)
+
+| Flag CLI | Variável de Ambiente | Padrão | Descrição |
+| :--- | :--- | :--- | :--- |
+| `--rag-enabled` | `RAG_ENABLED` | `true` | Habilita ou desabilita o motor de RAG (`--rag-enabled=false` para desativar). |
+| `--rag-mode` | `RAG_MODE` | `layered` | Modo de operação: `layered` (6 camadas completas), `supervised` (apenas RAG supervisionado no prompt + fallback), `full` (exemplo como guia de estilo) ou `none`. |
+| `--rag-kb-file` | `RAG_KB_FILE` | `kb/knowledge_base.json` | Caminho local **ou URL HTTP/HTTPS** para o arquivo JSON da base de conhecimento. |
+| `--rag-max-len` | `RAG_MAX_LEN` | `600` | Tamanho máximo (em caracteres) da essência do exemplo injetada no prompt do LLM. |
+| `--llm-timeout` | `LLM_TIMEOUT` | `7` | Tempo limite (em segundos) para geração do LLM antes de acionar o fallback automático. |
+
+---
+
+### Exemplos de Uso com RAG
+
+#### 1. Executando com a base local (`kb/knowledge_base.json`) e vLLM / OpenAI-compatible
+```bash
+./bin/galah \
+  --provider openai \
+  --server-url http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+  --api-key none \
+  --temperature 0.8 \
+  --rag-enabled \
+  --rag-mode layered \
+  --rag-kb-file kb/knowledge_base.json
+```
+
+#### 2. Carregando a base de conhecimento diretamente de uma URL remota
+```bash
+./bin/galah \
+  --provider ollama \
+  --server-url http://127.0.0.1:11434 \
+  --model qwen2.5:7b \
+  --temperature 0.8 \
+  --rag-enabled \
+  --rag-mode layered \
+  --rag-kb-file https://raw.githubusercontent.com/rafaelrcar/honeypot-llm-bench/refs/heads/main/kb/knowledge_base.json
+```
+
+#### 3. Uso via Biblioteca Go (`galah.Options`)
+```go
+svc, err := galah.NewService(context.Background(), galah.Options{
+    LLMProvider:    "openai",
+    LLMServerURL:   "http://127.0.0.1:8000/v1",
+    LLMModel:       "Qwen/Qwen2.5-7B-Instruct-AWQ",
+    LLMAPIKey:      "none",
+    LLMTemperature: 0.8,
+    RAGEnabled:     true,
+    RAGMode:        "layered",
+    RAGKBFile:      "kb/knowledge_base.json",
+    RAGMaxLen:      600,
+    LLMTimeout:     7 * time.Second,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+req, _ := http.NewRequest("GET", "http://example.com/.env", nil)
+respBytes, layer, err := svc.GenerateHTTPResponseWithSource(req, "8080")
+fmt.Printf("Layer: %s\nResponse: %s\n", layer, string(respBytes))
 ```
