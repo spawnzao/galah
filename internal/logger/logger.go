@@ -64,7 +64,7 @@ func (l *Logger) LogEvent(r *http.Request, resp llm.JSONResponse, port, respSour
 	fields := l.commonFields(r, port)
 	fields["httpResponse"] = resp
 
-	if respSource == "llm" {
+	if respSource == "llm" || respSource == "supervised" || respSource == "free" || respSource == "full" {
 		fields["responseMetadata"] = ResponseMetadata{
 			GenerationSource: respSource,
 			Info: LLMInfo{

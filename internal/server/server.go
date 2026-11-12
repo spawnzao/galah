@@ -32,7 +32,6 @@ import (
 var ignoreHeaders = map[string]bool{
 	// Standard headers to ignore
 	"content-length": true,
-	"content-type":   true,
 	"date":           true,
 	"expires":        true,
 	"last-modified":  true,
@@ -213,19 +212,23 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request, serverAdd
 		}
 	}
 
-	// Generate response using the service's LLM handler
+	// Generate response using the service's LLM/RAG handler
 	if response == nil {
 		if s.Service == nil {
 			s.Logger.WithPrefix("GALAH").Error("service is not configured")
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		response, err = s.Service.GenerateHTTPResponse(r, port)
+		var src string
+		response, src, err = s.Service.GenerateHTTPResponseWithSource(r, port)
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		respSource = "llm"
+		if src == "" {
+			src = "llm"
+		}
+		respSource = src
 	}
 
 	var respData llm.JSONResponse
@@ -261,11 +264,26 @@ func (s *Server) extractPort(serverAddr string) string {
 	return port
 }
 
+// validContentType accepts only well-formed media types from the LLM/RAG; anything
+// else falls back to Go's content sniffing, as before.
+var validContentType = regexp.MustCompile(`^[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+(\s*;.*)?$`)
+
 func (s *Server) sendResponse(w http.ResponseWriter, response llm.JSONResponse) {
 	for key, value := range response.Headers {
+		if strings.EqualFold(key, "content-type") {
+			if validContentType.MatchString(strings.TrimSpace(value)) {
+				w.Header().Set("Content-Type", strings.TrimSpace(value))
+			}
+			continue
+		}
 		if !isExcludedHeader(key) {
 			w.Header().Set(key, value)
 		}
+	}
+
+	// Optional status code chosen by the responder (RAG/LLM); 200 otherwise.
+	if response.Status >= 100 && response.Status <= 599 {
+		w.WriteHeader(response.Status)
 	}
 
 	if _, err := w.Write([]byte(response.Body)); err != nil {

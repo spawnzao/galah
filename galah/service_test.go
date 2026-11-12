@@ -239,3 +239,79 @@ func TestServiceLogEvent(t *testing.T) {
 		t.Fatalf("log file missing entry: %s", string(contents))
 	}
 }
+
+func TestGenerateHTTPResponseWithRAGLayers(t *testing.T) {
+	cfg := &config.Config{SystemPrompt: "sys", UserPrompt: "prompt: %q"}
+	tmpLog := filepath.Join(t.TempDir(), "eventlog.json")
+	kbFile := filepath.Join("..", "kb", "knowledge_base.json")
+
+	svc, err := NewServiceFromConfig(context.Background(), cfg, nil, Options{
+		LLMProvider:  "openai",
+		LLMModel:     "gpt-3.5-turbo",
+		LLMAPIKey:    "dummy",
+		EventLogFile: tmpLog,
+		CacheDBFile:  ":memory:",
+		RAGEnabled:   true,
+		RAGMode:      "layered",
+		RAGKBFile:    kbFile,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceFromConfig with RAG error: %v", err)
+	}
+	defer svc.Close()
+
+	var capturedUserPrompt string
+	svc.Model = &MockModel{
+		GenerateContentFunc: func(ctx context.Context, messages []llms.MessageContent, opts ...llms.CallOption) (*llms.ContentResponse, error) {
+			if len(messages) > 1 && len(messages[1].Parts) > 0 {
+				if tp, ok := messages[1].Parts[0].(llms.TextContent); ok {
+					capturedUserPrompt = tp.Text
+				}
+			}
+			return &llms.ContentResponse{Choices: []*llms.ContentChoice{{Content: `{"Headers":{"Content-Type":"text/plain"},"Body":"APP_NAME=AcmeIntranet"}`}}}, nil
+		},
+	}
+
+	// 1. Layer "404" (random scanner path)
+	req404 := httptest.NewRequest("GET", "http://example.com/aaa9", nil)
+	resp404, layer404, err := svc.GenerateHTTPResponseWithSource(req404, "8080")
+	if err != nil {
+		t.Fatalf("error on 404 layer: %v", err)
+	}
+	if layer404 != "404" || !strings.Contains(string(resp404), `"Status":404`) {
+		t.Fatalf("expected 404 layer with Status 404, got layer=%s, resp=%s", layer404, string(resp404))
+	}
+
+	// 2. Layer "cache" (static file in KB)
+	reqRobots := httptest.NewRequest("GET", "http://example.com/robots.txt", nil)
+	respRobots, layerRobots, err := svc.GenerateHTTPResponseWithSource(reqRobots, "8080")
+	if err != nil {
+		t.Fatalf("error on cache layer: %v", err)
+	}
+	if layerRobots != "cache" || !strings.Contains(string(respRobots), "User-agent") {
+		t.Fatalf("expected cache layer with robots.txt content, got layer=%s, resp=%s", layerRobots, string(respRobots))
+	}
+
+	// 3. Layer "cache-api" (exact JSON match in KB)
+	reqSwagger := httptest.NewRequest("GET", "http://example.com/swagger.json", nil)
+	respSwagger, layerSwagger, err := svc.GenerateHTTPResponseWithSource(reqSwagger, "8080")
+	if err != nil {
+		t.Fatalf("error on cache-api layer: %v", err)
+	}
+	if layerSwagger != "cache-api" || !strings.Contains(string(respSwagger), "openapi") {
+		t.Fatalf("expected cache-api layer with openapi content, got layer=%s", layerSwagger)
+	}
+
+	// 4. Layer "supervised" (/.env -> injects REFERENCE BODY START)
+	reqEnv := httptest.NewRequest("GET", "http://example.com/.env", nil)
+	respEnv, layerEnv, err := svc.GenerateHTTPResponseWithSource(reqEnv, "8080")
+	if err != nil {
+		t.Fatalf("error on supervised layer: %v", err)
+	}
+	if layerEnv != "supervised" || !strings.Contains(capturedUserPrompt, "--- REFERENCE BODY START ---") {
+		t.Fatalf("expected supervised layer with reference body in prompt, got layer=%s, prompt=%s", layerEnv, capturedUserPrompt)
+	}
+	if !strings.Contains(string(respEnv), "APP_NAME=AcmeIntranet") {
+		t.Fatalf("unexpected supervised response: %s", string(respEnv))
+	}
+}

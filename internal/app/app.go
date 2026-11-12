@@ -77,6 +77,11 @@ func (a *App) Run() error {
 		CacheDBFile:      args.CacheDBFile,
 		CacheDuration:    args.CacheDuration,
 		LogLevel:         args.LogLevel,
+		RAGEnabled:       args.RAGEnabled,
+		RAGMode:          args.RAGMode,
+		RAGKBFile:        args.RAGKBFile,
+		RAGMaxLen:        args.RAGMaxLen,
+		LLMTimeout:       time.Duration(args.LLMTimeout) * time.Second,
 	})
 	if err != nil {
 		cblog.Fatalf("error creating service: %s", err)

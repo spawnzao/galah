@@ -17,4 +17,9 @@ var args struct {
 	LogLevel         string  `arg:"-l,--log-level" help:"Log level (debug, info, error, fatal)" default:"info"`
 	SuricataEnabled  bool    `arg:"--suricata-enabled" help:"Enable Suricata HTTP rule checking" default:"false"`
 	SuricataRulesDir string  `arg:"--suricata-rules-dir" help:"Directory containing Suricata .rules files to check HTTP requests against" default:""`
+	RAGEnabled       bool    `arg:"--rag-enabled,env:RAG_ENABLED" help:"Enable layered/supervised RAG with knowledge base" default:"true"`
+	RAGMode          string  `arg:"--rag-mode,env:RAG_MODE" help:"RAG mode (layered, supervised, full, none)" default:"layered"`
+	RAGKBFile        string  `arg:"--rag-kb-file,env:RAG_KB_FILE" help:"Path or URL to RAG knowledge_base.json" default:"kb/knowledge_base.json"`
+	RAGMaxLen        int     `arg:"--rag-max-len,env:RAG_MAX_LEN" help:"Max character length for extracted reference essence in prompts" default:"600"`
+	LLMTimeout       int     `arg:"--llm-timeout,env:LLM_TIMEOUT" help:"Timeout in seconds for LLM generation before RAG fallback" default:"7"`
 }

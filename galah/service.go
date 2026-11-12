@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 	el "github.com/0x4d31/galah/internal/logger"
 	"github.com/0x4d31/galah/pkg/enrich"
 	"github.com/0x4d31/galah/pkg/llm"
-	cblog "github.com/charmbracelet/log"
+	"github.com/0x4d31/galah/pkg/rag"
 	"github.com/0x4d31/galah/pkg/suricata"
+	cblog "github.com/charmbracelet/log"
 	"github.com/tmc/langchaingo/llms"
 )
 
@@ -53,6 +55,11 @@ type Options struct {
 	CacheDuration    int
 	LogLevel         string
 	Logger           *cblog.Logger
+	RAGEnabled       bool
+	RAGMode          string
+	RAGKBFile        string
+	RAGMaxLen        int
+	LLMTimeout       time.Duration
 }
 
 // Service encapsulates the components required to generate HTTP responses.
@@ -65,6 +72,7 @@ type Service struct {
 	LLMConfig     llm.Config
 	Logger        *cblog.Logger
 	Model         llms.Model
+	RAG           *rag.Engine
 }
 
 // NewService loads configuration and initializes the components required for response generation.
@@ -169,6 +177,20 @@ func createService(ctx context.Context, cfg *config.Config, rules []config.Rule,
 		return nil, err
 	}
 
+	var ragEngine *rag.Engine
+	if opts.RAGEnabled || (opts.RAGMode != "" && opts.RAGMode != "none") {
+		ragEngine, err = rag.NewEngine(rag.Config{
+			KBFile:        opts.RAGKBFile,
+			Mode:          opts.RAGMode,
+			ExampleMaxLen: opts.RAGMaxLen,
+			LLMTimeout:    opts.LLMTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error initializing RAG engine: %w", err)
+		}
+		logger.WithPrefix("GALAH").Infof("loaded %d RAG knowledge base entries (mode: %s)", len(ragEngine.Entries), ragEngine.Mode)
+	}
+
 	return &Service{
 		Cache:         cacheDB,
 		CacheDuration: opts.CacheDuration,
@@ -178,35 +200,143 @@ func createService(ctx context.Context, cfg *config.Config, rules []config.Rule,
 		LLMConfig:     modelCfg,
 		Logger:        logger,
 		Model:         model,
+		RAG:           ragEngine,
 	}, nil
 }
 
-// GenerateHTTPResponse creates an HTTP response using the LLM.
+// GenerateHTTPResponse creates an HTTP response using the LLM (and RAG if enabled).
 func (s *Service) GenerateHTTPResponse(r *http.Request, port string) ([]byte, error) {
-	messages, err := llm.CreateMessageContent(r, s.Config, s.LLMConfig.Provider)
-	if err != nil {
-		s.Logger.WithPrefix("GALAH").Errorf("error creating llm message: %s", err)
-		return nil, err
+	resp, _, err := s.GenerateHTTPResponseWithSource(r, port)
+	return resp, err
+}
+
+// GenerateHTTPResponseWithSource creates an HTTP response and returns the response bytes
+// along with the generation source/layer (e.g., "llm", "404", "cache", "cache-api", "supervised", "free", "fallback-ref", etc.).
+func (s *Service) GenerateHTTPResponseWithSource(r *http.Request, port string) ([]byte, string, error) {
+	if s.RAG == nil {
+		messages, err := llm.CreateMessageContent(r, s.Config, s.LLMConfig.Provider)
+		if err != nil {
+			s.Logger.WithPrefix("GALAH").Errorf("error creating llm message: %s", err)
+			return nil, "", err
+		}
+
+		respStr, err := llm.GenerateLLMResponse(r.Context(), s.Model, s.LLMConfig.Temperature, messages)
+		if err != nil {
+			s.Logger.WithPrefix("GALAH").Errorf("error generating response: %s", err)
+			s.EventLogger.LogError(r, respStr, port, err)
+			return nil, "", err
+		}
+		resp := []byte(respStr)
+
+		s.Logger.WithPrefix("GALAH").Infof("generated HTTP response: %s", strings.ReplaceAll(respStr, "\n", " "))
+		s.storeInCache(r, port, resp)
+		return resp, "llm", nil
 	}
 
-	respStr, err := llm.GenerateLLMResponse(r.Context(), s.Model, s.LLMConfig.Temperature, messages)
-	if err != nil {
-		s.Logger.WithPrefix("GALAH").Errorf("error generating response: %s", err)
-		s.EventLogger.LogError(r, respStr, port, err)
-		return nil, err
+	// RAG Layered / Supervised flow (honeypot-llm-bench architecture)
+	reqPath := r.URL.Path
+	if reqPath == "" {
+		reqPath = r.RequestURI
 	}
-	resp := []byte(respStr)
+	if reqPath == "" {
+		reqPath = "/"
+	}
 
-	s.Logger.WithPrefix("GALAH").Infof("generated HTTP response: %s", strings.ReplaceAll(respStr, "\n", " "))
+	decision := s.RAG.Decide(r.Method, reqPath)
+	layer := decision.Layer
 
-	if s.CacheDuration != 0 {
+	var resp []byte
+	var err error
+
+	switch layer {
+	case "404", "cache-ico":
+		resp, err = rag.NotFoundResponse()
+		if err != nil {
+			return nil, "", err
+		}
+		s.Logger.WithPrefix("GALAH").Infof("RAG short-circuit [%s] for %s %s", layer, r.Method, reqPath)
+
+	case "cache", "cache-api":
+		resp, err = rag.ReferenceResponse(decision.Entry)
+		if err != nil {
+			return nil, "", err
+		}
+		entryID := ""
+		if decision.Entry != nil {
+			entryID = decision.Entry.ID
+		}
+		s.Logger.WithPrefix("GALAH").Infof("RAG short-circuit [%s] (entry=%s, sim=%.2f) for %s %s", layer, entryID, decision.Similarity, r.Method, reqPath)
+
+	default:
+		// Model-backed layers ("supervised", "full", "free")
+		httpReq, dumpErr := httputil.DumpRequest(r, true)
+		if dumpErr != nil {
+			s.Logger.WithPrefix("GALAH").Errorf("error dumping http request: %s", dumpErr)
+			return nil, "", dumpErr
+		}
+
+		userPrompt, _ := rag.BuildUserPrompt(string(httpReq), layer, decision.Entry, s.RAG.ExampleMaxLen)
+		messages := llm.CreateMessageContentFromPrompt(s.Config.SystemPrompt, userPrompt, s.LLMConfig.Provider)
+
+		callOpts := []llms.CallOption{
+			llms.WithMaxTokens(rag.DefaultMaxTokens),
+		}
+		if layer == "free" {
+			callOpts = append(callOpts, llms.WithRepetitionPenalty(rag.DefaultFreeRepetitionPenalty))
+		}
+
+		timeout := s.RAG.LLMTimeout
+		if timeout <= 0 {
+			timeout = rag.DefaultLLMTimeout
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+
+		rawContent, llmErr := s.callModelRaw(ctx, messages, callOpts...)
+		if llmErr != nil {
+			s.Logger.WithPrefix("GALAH").Warnf("RAG LLM call warning on layer [%s] for %s %s: %v (falling back)", layer, r.Method, reqPath, llmErr)
+		}
+
+		var leak string
+		resp, layer, leak = rag.ResolvePostLLM(rawContent, llmErr, decision.Entry, reqPath, layer)
+		if leak != "" {
+			s.Logger.WithPrefix("GALAH").Warnf("RAG security guardrail triggered (pattern=%s) for %s %s -> %s", leak, r.Method, reqPath, layer)
+		}
+		entryID := ""
+		if decision.Entry != nil {
+			entryID = decision.Entry.ID
+		}
+		s.Logger.WithPrefix("GALAH").Infof("RAG generated HTTP response [layer=%s, kb=%s, sim=%.2f]: %s", layer, entryID, decision.Similarity, strings.ReplaceAll(string(resp), "\n", " "))
+	}
+
+	s.storeInCache(r, port, resp)
+	return resp, layer, nil
+}
+
+func (s *Service) callModelRaw(ctx context.Context, messages []llms.MessageContent, extraOpts ...llms.CallOption) (string, error) {
+	callOpts := []llms.CallOption{
+		llms.WithJSONMode(),
+		llms.WithTemperature(s.LLMConfig.Temperature),
+	}
+	callOpts = append(callOpts, extraOpts...)
+
+	response, err := s.Model.GenerateContent(ctx, messages, callOpts...)
+	if err != nil {
+		return "", fmt.Errorf("contentGenerationError: %w", err)
+	}
+	if response == nil || len(response.Choices) == 0 || response.Choices[0].Content == "" {
+		return "", errors.New("emptyLLMResponse: empty model response")
+	}
+	return response.Choices[0].Content, nil
+}
+
+func (s *Service) storeInCache(r *http.Request, port string, resp []byte) {
+	if s.CacheDuration != 0 && s.Cache != nil {
 		key := cache.GetCacheKey(r, port)
 		if err := cache.StoreResponse(s.Cache, key, resp); err != nil {
 			s.Logger.WithPrefix("GALAH").Errorf("error storing response in cache: %s", err)
 		}
 	}
-
-	return resp, nil
 }
 
 // CheckCache verifies if a response for the given request and port exists in

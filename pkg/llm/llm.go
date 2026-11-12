@@ -30,6 +30,9 @@ type Config struct {
 type JSONResponse struct {
 	Headers map[string]string `json:"headers" validate:"required"`
 	Body    string            `json:"body" validate:"required"`
+	// Status is optional: an HTTP status code chosen by the responder (e.g. 404
+	// for scanner probes). Zero means the default 200.
+	Status int `json:"status,omitempty"`
 }
 
 var supportsSystemPrompt = map[string]bool{
@@ -61,11 +64,22 @@ func New(ctx context.Context, config Config) (llms.Model, error) {
 
 // GenerateLLMResponse generates a response from the LLM using the input message.
 func GenerateLLMResponse(ctx context.Context, model llms.Model, temperature float64, messages []llms.MessageContent) (string, error) {
+	return GenerateLLMResponseWithOptions(ctx, model, temperature, messages)
+}
+
+// GenerateLLMResponseWithOptions generates a response from the LLM with additional CallOptions
+// (such as WithMaxTokens or WithRepetitionPenalty).
+func GenerateLLMResponseWithOptions(ctx context.Context, model llms.Model, temperature float64, messages []llms.MessageContent, extraOpts ...llms.CallOption) (string, error) {
+	callOpts := []llms.CallOption{
+		llms.WithJSONMode(),
+		llms.WithTemperature(temperature),
+	}
+	callOpts = append(callOpts, extraOpts...)
+
 	response, err := model.GenerateContent(
 		ctx,
 		messages,
-		llms.WithJSONMode(),
-		llms.WithTemperature(temperature),
+		callOpts...,
 	)
 	if err != nil {
 		return "", fmt.Errorf("contentGenerationError: %s", err)
@@ -96,18 +110,21 @@ func CreateMessageContent(r *http.Request, cfg *config.Config, provider string) 
 	}
 
 	userPrompt := fmt.Sprintf(cfg.UserPrompt, strings.TrimSpace(string(httpReq)))
-	systemPrompt := cfg.SystemPrompt
+	return CreateMessageContentFromPrompt(cfg.SystemPrompt, userPrompt, provider), nil
+}
 
+// CreateMessageContentFromPrompt builds LLM messages from explicit system and user prompt strings.
+func CreateMessageContentFromPrompt(systemPrompt, userPrompt, provider string) []llms.MessageContent {
 	if supportsSystemPrompt[provider] {
 		return []llms.MessageContent{
 			llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt),
 			llms.TextParts(llms.ChatMessageTypeHuman, userPrompt),
-		}, nil
+		}
 	}
 
 	return []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeHuman, systemPrompt+"\n"+userPrompt),
-	}, nil
+	}
 }
 
 func cleanResponse(input string) string {
