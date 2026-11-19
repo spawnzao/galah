@@ -35,6 +35,9 @@ func TestDecideLayers(t *testing.T) {
 	d = eng.Decide("GET", "/%23")
 	assert.Equal(t, "404", d.Layer)
 
+	d = eng.Decide("GET", "/#")
+	assert.Equal(t, "404", d.Layer)
+
 	// /HNAP1 is uppercase and must NOT match RandomPathRx
 	d = eng.Decide("GET", "/HNAP1")
 	assert.Equal(t, "supervised", d.Layer)

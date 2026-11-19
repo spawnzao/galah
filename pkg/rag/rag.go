@@ -32,7 +32,8 @@ var (
 	// StaticPathRx matches static asset paths (favicon, robots.txt, sitemaps, security.txt, images/styles/scripts).
 	StaticPathRx = regexp.MustCompile(`(?i)(favicon\.ico|robots\.txt|sitemap[\w-]*\.xml|security\.txt|\.(png|jpg|gif|css|js|ico|woff2?))$`)
 	// RandomPathRx matches scanner random probe paths (case-sensitive so /HNAP1 is not treated as random).
-	RandomPathRx = regexp.MustCompile(`^/[a-z]{3,4}\d{1,2}$|^/%23$|^/[a-z0-9]{8,}$`)
+	// Matches both raw /%23 and URL-decoded /#.
+	RandomPathRx = regexp.MustCompile(`^/[a-z]{3,4}\d{1,2}$|^/(%23|#)$|^/[a-z0-9]{8,}$`)
 	// WordRx tokenizes paths into lowercase alphanumeric tokens.
 	WordRx = regexp.MustCompile(`[a-z0-9]+`)
 	// APICacheTypes lists content-type substrings eligible for direct API caching when similarity == 1.0.
@@ -220,7 +221,10 @@ func (e *Engine) RetrieveSim(method, rawPath string) (*Entry, float64) {
 		}
 		for _, toks := range entry.tokenVariants {
 			if len(q) == 0 && len(toks) == 0 {
-				return entry, 1.0 // root "/" with root "/"
+				if pathOnly == "/" || pathOnly == "" {
+					return entry, 1.0 // root "/" with root "/"
+				}
+				continue
 			}
 			if len(q) == 0 || len(toks) == 0 {
 				continue

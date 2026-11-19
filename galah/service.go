@@ -234,9 +234,16 @@ func (s *Service) GenerateHTTPResponseWithSource(r *http.Request, port string) (
 	}
 
 	// RAG Layered / Supervised flow (honeypot-llm-bench architecture)
-	reqPath := r.URL.Path
-	if reqPath == "" {
+	// Prefer raw RequestURI / EscapedPath so percent-encoded probes (e.g. /%23, /cgi-bin/.%2e/...)
+	// preserve their raw wire format instead of being URL-decoded by Go's net/http into /#.
+	reqPath := ""
+	if strings.HasPrefix(r.RequestURI, "/") {
 		reqPath = r.RequestURI
+	} else if r.URL != nil {
+		reqPath = r.URL.EscapedPath()
+		if reqPath == "" {
+			reqPath = r.URL.Path
+		}
 	}
 	if reqPath == "" {
 		reqPath = "/"

@@ -272,7 +272,7 @@ func TestGenerateHTTPResponseWithRAGLayers(t *testing.T) {
 		},
 	}
 
-	// 1. Layer "404" (random scanner path)
+	// 1. Layer "404" (random scanner path, including percent-encoded /%23)
 	req404 := httptest.NewRequest("GET", "http://example.com/aaa9", nil)
 	resp404, layer404, err := svc.GenerateHTTPResponseWithSource(req404, "8080")
 	if err != nil {
@@ -280,6 +280,15 @@ func TestGenerateHTTPResponseWithRAGLayers(t *testing.T) {
 	}
 	if layer404 != "404" || !strings.Contains(string(resp404), `"Status":404`) {
 		t.Fatalf("expected 404 layer with Status 404, got layer=%s, resp=%s", layer404, string(resp404))
+	}
+
+	reqHash := httptest.NewRequest("GET", "http://example.com/%23", nil)
+	respHash, layerHash, err := svc.GenerateHTTPResponseWithSource(reqHash, "8080")
+	if err != nil {
+		t.Fatalf("error on /%%23 404 layer: %v", err)
+	}
+	if layerHash != "404" || !strings.Contains(string(respHash), `"Status":404`) {
+		t.Fatalf("expected 404 layer for /%%23, got layer=%s, resp=%s", layerHash, string(respHash))
 	}
 
 	// 2. Layer "cache" (static file in KB)
