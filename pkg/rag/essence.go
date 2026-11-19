@@ -264,7 +264,8 @@ func truncateString(s string, maxLen int) string {
 // BuildUserPrompt constructs the user prompt for the LLM following honeypot-llm-bench's build_user_prompt_ex
 // and appends the Galah anti-prompt-injection tail.
 func BuildUserPrompt(httpRequest, ragMode string, entry *Entry, maxLen int) (string, bool) {
-	base := fmt.Sprintf("Analyze the following HTTP request and generate the response:\n\n%s", strings.TrimSpace(httpRequest))
+	cleanReq := strings.TrimSpace(strings.ReplaceAll(httpRequest, "\r\n", "\n"))
+	base := fmt.Sprintf("Analyze the following HTTP request and generate the response:\n\n%s", cleanReq)
 	if ragMode == "none" || ragMode == "free" || entry == nil {
 		return base + GalahTail, false
 	}

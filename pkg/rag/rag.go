@@ -209,6 +209,7 @@ func (e *Engine) RetrieveSim(method, rawPath string) (*Entry, float64) {
 
 	var best *Entry
 	bestSim := 0.0
+	var exactAnyMethod *Entry
 
 	for i := range e.Entries {
 		entry := &e.Entries[i]
@@ -216,12 +217,9 @@ func (e *Engine) RetrieveSim(method, rawPath string) (*Entry, float64) {
 		if em == "" {
 			em = "GET"
 		}
-		if em != m {
-			continue
-		}
 		for _, toks := range entry.tokenVariants {
 			if len(q) == 0 && len(toks) == 0 {
-				if pathOnly == "/" || pathOnly == "" {
+				if em == m && (pathOnly == "/" || pathOnly == "") {
 					return entry, 1.0 // root "/" with root "/"
 				}
 				continue
@@ -230,15 +228,23 @@ func (e *Engine) RetrieveSim(method, rawPath string) (*Entry, float64) {
 				continue
 			}
 			sim := Jaccard(q, toks)
-			if sim > bestSim {
-				bestSim = sim
-				best = entry
+			if em == m {
+				if sim > bestSim {
+					bestSim = sim
+					best = entry
+				}
+			} else if sim == 1.0 && exactAnyMethod == nil {
+				// Fallback for explicit aliases registered under a different method (e.g. POST /wp-json/batch/v1 in R17)
+				exactAnyMethod = entry
 			}
 		}
 	}
 
 	if bestSim >= e.MinSim {
 		return best, bestSim
+	}
+	if exactAnyMethod != nil {
+		return exactAnyMethod, 1.0
 	}
 	return nil, bestSim
 }
@@ -248,7 +254,7 @@ func (e *Engine) RetrieveSim(method, rawPath string) (*Entry, float64) {
 //  1. "404"        -> random scanner path (/aaa9, /%23, etc.)
 //  2. "cache"      -> static path with KB entry (robots.txt, sitemap.xml, etc.)
 //     "cache-ico"  -> .ico path without KB entry (returns 404 HTML)
-//  3. "cache-api"  -> exact token match (sim >= 1.0) on JSON/JS KB entry
+//  3. "cache-api"  -> exact token match (sim >= 1.0) on JSON/JS KB entry with matching method
 //  4. "supervised" -> family match in KB (sim >= 0.5), LLM reproduces essence
 //  5. "free"       -> no KB match, LLM generates freely with repetition_penalty 1.1
 func (e *Engine) Decide(method, rawPath string) Decision {
@@ -289,7 +295,7 @@ func (e *Engine) Decide(method, rawPath string) Decision {
 
 	// 3. KB retrieval by similarity
 	entry, sim := e.RetrieveSim(method, path)
-	if entry != nil && sim >= e.APICacheMinSim && isAPICacheType(entry.ContentType) {
+	if entry != nil && sim >= e.APICacheMinSim && isAPICacheType(entry.ContentType) && strings.EqualFold(entry.Method, method) {
 		return Decision{Layer: "cache-api", Entry: entry, Similarity: sim}
 	}
 	if entry != nil {

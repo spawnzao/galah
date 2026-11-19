@@ -100,6 +100,12 @@ func TestDecideLayers(t *testing.T) {
 	dFree := eng.Decide("GET", "/owa/")
 	assert.Equal(t, "free", dFree.Layer)
 	assert.Nil(t, dFree.Entry)
+
+	// 7. POST /wp-json/batch/v1 (T09) matches explicit alias in R17 as "supervised" (with fallback-ref on timeout)
+	dWpBatch := eng.Decide("POST", "/wp-json/batch/v1")
+	assert.Equal(t, "supervised", dWpBatch.Layer)
+	require.NotNil(t, dWpBatch.Entry)
+	assert.Equal(t, "R17", dWpBatch.Entry.ID)
 }
 
 func TestExampleEssence(t *testing.T) {

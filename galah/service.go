@@ -299,6 +299,12 @@ func (s *Service) GenerateHTTPResponseWithSource(r *http.Request, port string) (
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 
+		if layer == "free" {
+			ctx = llm.WithOpenAIExtraFields(ctx, map[string]any{
+				"repetition_penalty": rag.DefaultFreeRepetitionPenalty,
+			})
+		}
+
 		rawContent, llmErr := s.callModelRaw(ctx, messages, callOpts...)
 		if llmErr != nil {
 			s.Logger.WithPrefix("GALAH").Warnf("RAG LLM call warning on layer [%s] for %s %s: %v (falling back)", layer, r.Method, reqPath, llmErr)
